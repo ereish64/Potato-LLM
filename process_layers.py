@@ -8,7 +8,7 @@ memory-efficient, layer-by-layer inference.
 
 import os
 import torch
-from transformers import LlamaForCausalLM, LlamaTokenizer, LlamaConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM, LlamaConfig
 
 
 def save_llama_layers(model_name: str, output_dir: str = "model_layers"):
@@ -18,8 +18,13 @@ def save_llama_layers(model_name: str, output_dir: str = "model_layers"):
     """
     # 1) Load the full model and tokenizer
     print(f"Loading model from: {model_name}")
-    model = LlamaForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16)
-    tokenizer = LlamaTokenizer.from_pretrained(model_name)
+
+    config = LlamaConfig.from_pretrained("/mnt/e/Llama-3.1-70B/config.json")
+    # print config information
+    print(config)
+    
+    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16, device_map={"": "cpu"})
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     config = model.config
 
     # Make sure output directory exists
@@ -47,4 +52,4 @@ def save_llama_layers(model_name: str, output_dir: str = "model_layers"):
 
 
 if __name__ == "__main__":
-    save_llama_layers("/mnt/e/llama", "/mnt/e/model_layers")
+    save_llama_layers("/mnt/e/Llama-3.1-70B/", "/mnt/e/model_layers")
