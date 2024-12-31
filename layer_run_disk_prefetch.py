@@ -242,6 +242,7 @@ def layer_by_layer_inference(
         del decoder_layer
 
     # Final norm & head
+    hidden_states = hidden_states.to(device)  # Ensure hidden_states is on GPU
     hidden_states = final_norm(hidden_states)
     logits = lm_head(hidden_states)
 
@@ -319,8 +320,8 @@ if __name__ == "__main__":
     load_lm_head_from_disk(model, layers_dir, device=device)
 
     # Define the number of layers to prefetch ahead and number of workers
-    PREFETCH_COUNT = 2
-    NUM_PREFETCH_WORKERS = 12  # Adjust based on your system's capabilities
+    PREFETCH_COUNT = 3
+    NUM_PREFETCH_WORKERS = 4  # Adjust based on your system's capabilities
 
     # Start background prefetch threads
     prefetch_threads = []
