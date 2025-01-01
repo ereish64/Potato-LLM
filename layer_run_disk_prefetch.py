@@ -219,7 +219,7 @@ def layer_by_layer_inference(
         layer_loaded_on_gpu[i] = True
 
         # Wait for GPU to finish loading
-        torch.cuda.current_stream(device).wait_stream(transfer_stream)
+        # torch.cuda.current_stream(device).wait_stream(transfer_stream)
 
         # The forward pass
         batch_size, seq_len = hidden_states.shape[:2]
@@ -234,16 +234,20 @@ def layer_by_layer_inference(
             )[0]
 
         # Wait for the compute stream to finish
-        torch.cuda.current_stream(device).wait_stream(compute_stream)
+        # torch.cuda.current_stream(device).wait_stream(compute_stream)
 
         # Offload from GPU to free memory
         decoder_layer.to("cpu")
         layer_loaded_on_gpu[i] = False
         del decoder_layer
+        torch.cuda.empty_cache()
 
     # Final norm & head
     hidden_states = hidden_states.to(device)  # Ensure hidden_states is on GPU
+    final_norm = final_norm.to(device)
     hidden_states = final_norm(hidden_states)
+
+    lm_head = lm_head.to(device)
     logits = lm_head(hidden_states)
 
     final_norm.to("cpu")
@@ -260,7 +264,7 @@ def generate_tokens_with_temperature(
     max_new_tokens=5, 
     device=torch.device("cuda"), 
     temperature=1.0,
-    prefetch_count: int = 3
+    prefetch_count: int = 2
 ):
     """
     Generate tokens from the model, layer by layer, while applying a temperature.
@@ -320,7 +324,7 @@ if __name__ == "__main__":
     load_lm_head_from_disk(model, layers_dir, device=device)
 
     # Define the number of layers to prefetch ahead and number of workers
-    PREFETCH_COUNT = 3
+    PREFETCH_COUNT = 4
     NUM_PREFETCH_WORKERS = 4  # Adjust based on your system's capabilities
 
     # Start background prefetch threads
@@ -337,7 +341,7 @@ if __name__ == "__main__":
             tokenizer=tokenizer,
             prompt=prompt_text,
             layers_dir=layers_dir,
-            max_new_tokens=5, 
+            max_new_tokens=2, 
             device=device, 
             temperature=1.0,
             prefetch_count=PREFETCH_COUNT
