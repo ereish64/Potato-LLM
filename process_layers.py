@@ -51,7 +51,6 @@ def save_llama_layers(model_name: str, output_dir: str = "model_layers"):
     #         )
     #     )
     # torch.save(filtered_embeddings, os.path.join(output_dir, "embed_tokens.pt"))
-    # torch.save(embed_tokens, savepath)
 
 
     # 4) Save each decoder layer
