@@ -287,6 +287,14 @@ scheduled_layers = set()
 #  Modified prefetch_worker to use PatchedLlamaDecoderLayer
 ##############################################################################
 def prefetch_worker(layers_dir: str, config: AutoConfig, dtype: torch.dtype):
+    """
+    Prefetch worker to load layers from disk and cache them into CPU RAM.
+
+    Parameters:
+        layers_dir: str - Directory containing layer weights
+        config: AutoConfig - Model configuration
+        dtype: torch.dtype - Data type for weights
+    """
     global stop_prefetch
     try:
         while not stop_prefetch:
@@ -331,7 +339,7 @@ def prefetch_worker(layers_dir: str, config: AutoConfig, dtype: torch.dtype):
         print(f"Prefetch worker failed: {e}")
 
 ##############################################################################
-# 1. Utility functions to load embeddings, norm, lm_head
+# 1. Utility functions to load embeddings, norm, lm_head from the disk to CPU RAM
 ##############################################################################
 def load_embed_tokens_from_disk(model, layers_dir: str, device: torch.device, dtype: torch.dtype):
     emb_path = os.path.join(layers_dir, "embed_tokens.pt")
@@ -411,6 +419,25 @@ def layer_by_layer_inference(
     final_norm=None,
     lm_head=None
 ) -> torch.Tensor:
+    """
+    Perform layer-by-layer inference on a model with offloaded weights. Loads each layer from CPU ram to GPU then runs inference, rinse and repeat for each layer.
+
+    Parameters:
+        model: LlamaForCausalLM - The model to run inference on
+        input_ids: torch.LongTensor - The input token IDs
+        layers_dir: str - The directory containing the model layers
+        config: AutoConfig - The model configuration
+        dtype: torch.dtype - The data type to use for inference
+        device: torch.device - The device to run inference on
+        prefetch_count: int - The number of layers to prefetch
+        embed_layer: nn.Embedding - The embedding layer to use for inference
+        final_norm: nn.LayerNorm - The final normalization layer
+        lm_head: nn.Linear - The LM head layer
+
+    Returns:
+        torch.Tensor - The logits for the next token
+    """
+
     transfer_stream = torch.cuda.Stream(device=device, priority=-1)
     compute_stream = torch.cuda.Stream(device=device, priority=0)
 
@@ -487,10 +514,10 @@ def layer_by_layer_inference(
                 use_cache=False,
             )[0]
 
+        # wait for compute to finish. Maybe we don't need this.
         torch.cuda.current_stream(device).wait_stream(compute_stream)
 
         # Cleanup
-        decoder_layer.to("cpu")
         del decoder_layer
         torch.cuda.empty_cache()
         print(f"Layer {i} took {time.time() - stime:.2f}s")
@@ -502,10 +529,6 @@ def layer_by_layer_inference(
 
     lm_head = lm_head.to(device, dtype=dtype)
     logits = lm_head(hidden_states)
-
-    # Cleanup
-    final_norm.to("cpu")
-    lm_head.to("cpu")
 
     return logits
 
@@ -524,11 +547,36 @@ def generate_tokens_with_temperature(
     final_norm=None,
     lm_head=None
 ):
+    """
+    Generate new tokens from a prompt using the model with layer-by-layer inference to generate each token
+    
+    Parameters:
+        model: LlamaForCausalLM - The model to generate tokens with
+        tokenizer: PreTrainedTokenizerFast - The tokenizer to use for encoding/decoding
+        prompt: str - The input prompt to generate tokens from
+        layers_dir: str - The directory containing the model layers
+        config: AutoConfig - The model configuration
+        dtype: torch.dtype - The data type to use for inference
+        max_new_tokens: int - The maximum number of tokens to generate
+        device: torch.device - The device to run inference on
+        temperature: float - The temperature to use for sampling
+        prefetch_count: int - The number of layers to prefetch
+        embed_layer: nn.Embedding - The embedding layer to use for inference
+        final_norm: nn.LayerNorm - The final normalization layer
+        lm_head: nn.Linear - The LM head layer
+    
+    Returns:
+        str - The generated tokens as a string
+    """
+    # tokenize our input prompt
     input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
 
+    # switch model to eval mode
     with torch.inference_mode():
         model.eval()
+        # loop until we have generated the max number of new tokens
         for _ in range(max_new_tokens):
+            # run layer-by-layer inference for one token
             logits = layer_by_layer_inference(
                 model,
                 input_ids,
@@ -541,24 +589,24 @@ def generate_tokens_with_temperature(
                 final_norm=final_norm,
                 lm_head=lm_head
             )
-            # logits = logits.to("cpu")
+            # get the logits for the next token
             next_logit = logits[:, -1, :] / temperature
             next_logit = torch.nan_to_num(next_logit, nan=0.0, posinf=1e4, neginf=-1e4)
             next_logit = torch.clamp(next_logit, min=-50.0, max=50.0)
 
-            with torch.device("cpu"):
-                top_k = 20
-                sorted_logits, sorted_indices = torch.sort(next_logit, descending=True)
-                kth_val = sorted_logits[:, top_k - 1].unsqueeze(-1)
-                filtered_logits = torch.where(
-                    next_logit < kth_val,
-                    torch.full_like(next_logit, float('-inf')),
-                    next_logit
-                )
-                probs = torch.softmax(filtered_logits, dim=-1)
-                next_token_id = torch.multinomial(probs, num_samples=1)
+            # calculate top-k logits. This needs to be moved to the function parameters at some point.
+            top_k = 20
+            sorted_logits, sorted_indices = torch.sort(next_logit, descending=True)
+            kth_val = sorted_logits[:, top_k - 1].unsqueeze(-1)
+            filtered_logits = torch.where(
+                next_logit < kth_val,
+                torch.full_like(next_logit, float('-inf')),
+                next_logit
+            )
+            probs = torch.softmax(filtered_logits, dim=-1)
+            next_token_id = torch.multinomial(probs, num_samples=1)
 
-                input_ids = torch.cat([input_ids, next_token_id], dim=1).to(device)
+            input_ids = torch.cat([input_ids, next_token_id], dim=1).to(device)
 
     return tokenizer.decode(input_ids[0], skip_special_tokens=False)
 
@@ -571,7 +619,7 @@ if __name__ == "__main__":
     # Load configuration
     config = AutoConfig.from_pretrained(layers_dir)
 
-    # Map string dtype to torch dtype
+    # Map string dtype to the model's torch dtype
     dtype_mapping = {
         "float32": torch.float32,
         "float16": torch.float16,
@@ -582,28 +630,27 @@ if __name__ == "__main__":
     # Set default dtype based on config
     torch.set_default_dtype(dtype)
 
-    with init_empty_weights():
-        model = LlamaForCausalLM(config)
-
     print(config)
 
+    # Load tokenizer to CPU RAM
     tokenizer = PreTrainedTokenizerFast.from_pretrained(layers_dir)
     print("Special tokens:", tokenizer.all_special_tokens)
     print("Special tokens count:", len(tokenizer.all_special_tokens))
 
+    # Initialize model with empty weights
     with init_empty_weights():
         model = LlamaForCausalLM(config)
 
-    # Load embeddings, final norm, lm_head
+    # Load embeddings, final norm, lm_head from the disk to CPU RAM
     embed_layer = load_embed_tokens_from_disk(model, layers_dir, device=torch.device("cuda"), dtype=dtype)
     final_norm = load_final_norm_from_disk(model, layers_dir, device=torch.device("cuda"), dtype=dtype)
     lm_head = load_lm_head_from_disk(model, layers_dir, device=torch.device("cuda"), dtype=dtype)
 
-    # Externalize prefetch settings to config or define them as variables
-    PREFETCH_COUNT = 12
-    NUM_PREFETCH_WORKERS = 12
+    # set the number of prefetch workers
+    NUM_PREFETCH_WORKERS = 8
+    PREFETCH_COUNT = NUM_PREFETCH_WORKERS
 
-    # Initialize data types and device
+    # set the target device which in this case is a CUDA GPU.
     device = torch.device("cuda")
     
     # Start prefetch threads
@@ -618,6 +665,7 @@ if __name__ == "__main__":
         prefetch_threads.append(thread)
 
     try:
+        # example prompt
         prompt_text = """You are a helpful AI assistant. Always respond cheerfully and with text.
 
 User: Do you have a name?

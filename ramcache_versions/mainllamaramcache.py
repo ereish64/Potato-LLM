@@ -491,10 +491,6 @@ def layer_by_layer_inference(
     lm_head = lm_head.to(device, dtype=dtype)
     logits = lm_head(hidden_states)
 
-    # Cleanup
-    final_norm.to("cpu")
-    lm_head.to("cpu")
-
     return logits
 
 def generate_tokens_with_temperature(
