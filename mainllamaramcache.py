@@ -5,6 +5,9 @@ import torch
 import time
 import copy
 import math
+import multiprocessing
+
+
 from torch import nn
 from transformers import (
     LlamaForCausalLM,
@@ -115,16 +118,8 @@ class PatchedLlamaAttention(LlamaAttention):
 
         # Handle GQA by repeating KV heads
         if self.num_key_value_groups > 1:
-            key_states = torch.repeat_interleave(
-                key_states, 
-                repeats=self.num_key_value_groups, 
-                dim=1
-            )
-            value_states = torch.repeat_interleave(
-                value_states,
-                repeats=self.num_key_value_groups,
-                dim=1
-            )
+            key_states = torch.repeat_interleave(key_states, repeats=self.num_key_value_groups, dim=1)
+            value_states = torch.repeat_interleave(value_states, repeats=self.num_key_value_groups, dim=1)
 
         # Compute scaled dot-product attention
         attn_weights = torch.matmul(query_states, key_states.transpose(-1, -2))
@@ -286,7 +281,7 @@ scheduled_layers = set()
 ##############################################################################
 #  Modified prefetch_worker to use PatchedLlamaDecoderLayer
 ##############################################################################
-def prefetch_worker(layers_dir: str, config: AutoConfig, dtype: torch.dtype):
+def prefetch_worker(layers_dir: str, config: AutoConfig, dtype: torch.dtype, patched_layers=None):
     global stop_prefetch
     try:
         while not stop_prefetch:
@@ -305,14 +300,7 @@ def prefetch_worker(layers_dir: str, config: AutoConfig, dtype: torch.dtype):
                     continue
 
             try:
-                with init_empty_weights():
-                    decoder_layer = PatchedLlamaDecoderLayer(config, layer_idx=layer_idx)
-
-                decoder_layer.to_empty(device="cpu")
-                state_path = os.path.join(layers_dir, f"layer_{layer_idx}.pt")
-                loaded_state = torch.load(state_path, map_location="cpu")
-                decoder_layer.load_state_dict(loaded_state)
-                decoder_layer.eval()
+                decoder_layer = patched_layers[layer_idx]
 
                 with cache_condition:
                     layer_weights_cache[layer_idx] = decoder_layer
@@ -436,8 +424,8 @@ def layer_by_layer_inference(
 
     # Process layers with appropriate dimensions
     for i in range(num_layers):
-        print(f"Processing layer {i}/{num_layers}...")
-        stime = time.time()
+        # print(f"Processing layer {i}/{num_layers}...")
+        # stime = time.time()
 
         # Prefetch handling remains the same
         with cache_condition:
@@ -490,9 +478,10 @@ def layer_by_layer_inference(
         torch.cuda.current_stream(device).wait_stream(compute_stream)
 
         # Cleanup
+        # decoder_layer.to("cpu")
         del decoder_layer
         torch.cuda.empty_cache()
-        print(f"Layer {i} took {time.time() - stime:.2f}s")
+        # print(f"Layer {i} took {time.time() - stime:.2f}s")
 
     # Final processing
     hidden_states = hidden_states.to(device)
@@ -528,6 +517,7 @@ def generate_tokens_with_temperature(
     with torch.inference_mode():
         model.eval()
         for _ in range(max_new_tokens):
+            stime = time.time()
             logits = layer_by_layer_inference(
                 model,
                 input_ids,
@@ -545,25 +535,37 @@ def generate_tokens_with_temperature(
             next_logit = torch.nan_to_num(next_logit, nan=0.0, posinf=1e4, neginf=-1e4)
             next_logit = torch.clamp(next_logit, min=-50.0, max=50.0)
 
-            with torch.device("cpu"):
-                top_k = 20
-                sorted_logits, sorted_indices = torch.sort(next_logit, descending=True)
-                kth_val = sorted_logits[:, top_k - 1].unsqueeze(-1)
-                filtered_logits = torch.where(
-                    next_logit < kth_val,
-                    torch.full_like(next_logit, float('-inf')),
-                    next_logit
-                )
-                probs = torch.softmax(filtered_logits, dim=-1)
-                next_token_id = torch.multinomial(probs, num_samples=1)
+            top_k = 20
+            sorted_logits, sorted_indices = torch.sort(next_logit, descending=True)
+            kth_val = sorted_logits[:, top_k - 1].unsqueeze(-1)
+            filtered_logits = torch.where(
+                next_logit < kth_val,
+                torch.full_like(next_logit, float('-inf')),
+                next_logit
+            )
+            probs = torch.softmax(filtered_logits, dim=-1)
+            next_token_id = torch.multinomial(probs, num_samples=1)
 
-                input_ids = torch.cat([input_ids, next_token_id], dim=1).to(device)
+            input_ids = torch.cat([input_ids, next_token_id], dim=1).to(device)
+            print(f"Single token generation took {time.time() - stime:.2f}s")
 
     return tokenizer.decode(input_ids[0], skip_special_tokens=False)
 
+def create_layer_cache(args):
+    config, i, layers_dir = args
+    print(f"Preprocessing layer {i}...")
+    with init_empty_weights():
+        patched_layer = PatchedLlamaDecoderLayer(config, layer_idx=i)
+        patched_layer.to_empty(device="cpu")
+    state_path = os.path.join(layers_dir, f"layer_{i}.pt")
+    loaded_state = torch.load(state_path, map_location="cpu")
+    patched_layer.load_state_dict(loaded_state)
+    patched_layer.eval()
+    return patched_layer
+
 if __name__ == "__main__":
     # layers_dir = "E:/Llama-3.1-8B/"  # Update this path as needed
-    layers_dir = "F:/70b_model_layers"
+    layers_dir = "F:/7b_model_layers"
 
     print(f"Loading config/tokenizer from: {layers_dir}")
 
@@ -586,7 +588,9 @@ if __name__ == "__main__":
 
     print(config)
 
-    tokenizer = PreTrainedTokenizerFast.from_pretrained(layers_dir)
+    # tokenizer = PreTrainedTokenizerFast.from_pretrained(layers_dir)
+    tokenizer = AutoTokenizer.from_pretrained(layers_dir, trust_remote_code=True)
+
     print("Special tokens:", tokenizer.all_special_tokens)
     print("Special tokens count:", len(tokenizer.all_special_tokens))
 
@@ -599,18 +603,27 @@ if __name__ == "__main__":
     lm_head = load_lm_head_from_disk(model, layers_dir, device=torch.device("cuda"), dtype=dtype)
 
     # Externalize prefetch settings to config or define them as variables
-    PREFETCH_COUNT = 12
-    NUM_PREFETCH_WORKERS = 12
+    PREFETCH_COUNT = 8
+    NUM_PREFETCH_WORKERS = 8
 
     # Initialize data types and device
     device = torch.device("cuda")
+
+    print("Generating initial layer cache...")
+
+    with multiprocessing.Pool() as pool:
+        args = []
+        for i in range(config.num_hidden_layers):
+            args.append((config, i, layers_dir))
+        patched_layers = pool.map(create_layer_cache, args)
     
     # Start prefetch threads
+    print("launching workers...")
     prefetch_threads = []
     for _ in range(NUM_PREFETCH_WORKERS):
         thread = threading.Thread(
             target=prefetch_worker,
-            args=(layers_dir, config, dtype),
+            args=(layers_dir, config, dtype, patched_layers),
             daemon=True
         )
         thread.start()
@@ -618,7 +631,6 @@ if __name__ == "__main__":
 
     try:
         prompt_text = """You are a helpful AI assistant. Always respond cheerfully and with text.
-
 User: Do you have a name?
 
 """
@@ -629,9 +641,9 @@ User: Do you have a name?
             layers_dir=layers_dir,
             config=config,
             dtype=dtype,
-            max_new_tokens=7,
+            max_new_tokens=20,
             device=device, 
-            temperature=0.6,
+            temperature=0.5,
             prefetch_count=PREFETCH_COUNT,
             embed_layer=embed_layer,
             final_norm=final_norm,
