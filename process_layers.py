@@ -39,7 +39,7 @@ def save_llama_layers(model_name: str, output_dir: str = "model_layers"):
     print(f"Special token IDs: {special_token_ids}")
 
     # 3) Save embedding without special tokens
-    print("Saving embedding layer (excluding special tokens)...")
+    print("Saving embedding layer...")
     savepath = output_dir+"/embed_tokens.pt"
     # embed_tokens = model.model.embed_tokens.weight.detach().clone()
     torch.save(model.model.embed_tokens.state_dict(), savepath)
@@ -52,8 +52,8 @@ def save_llama_layers(model_name: str, output_dir: str = "model_layers"):
     #     )
     # torch.save(filtered_embeddings, os.path.join(output_dir, "embed_tokens.pt"))
 
-
     # 4) Save each decoder layer
+    print("Saving layer state dictionaries...")
     for i, layer in enumerate(model.model.layers):
         print(f"Saving layer {i}...")
         torch.save(layer.state_dict(), output_dir+f"/layer_{i}.pt")
@@ -66,5 +66,6 @@ def save_llama_layers(model_name: str, output_dir: str = "model_layers"):
     print(f"All layers saved to: {output_dir}")
 
 if __name__ == "__main__":
-    save_llama_layers("E:/Llama-3.1-7B/", "F:/7b_model_layers")
+    # save_llama_layers("E:/Llama-2-70B/", "F:/70b_model_layers")
+    save_llama_layers("E:/Llama-3.1-8B/", "F:/8b_model_layers")
 
