@@ -563,7 +563,7 @@ def generate_tokens_with_temperature(
 
 if __name__ == "__main__":
     # layers_dir = "E:/Llama-3.1-8B/"  # Update this path as needed
-    layers_dir = "F:/70b_model_layers"
+    layers_dir = "F:/8b_model_layers"
 
     print(f"Loading config/tokenizer from: {layers_dir}")
 

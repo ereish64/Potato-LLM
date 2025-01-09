@@ -612,7 +612,7 @@ def generate_tokens_with_temperature(
 
 if __name__ == "__main__":
     # layers_dir = "E:/Llama-3.1-8B/"  # Update this path as needed
-    layers_dir = "F:/70b_model_layers"
+    layers_dir = "E:/Llama-2-7B-model-layers"
 
     print(f"Loading config/tokenizer from: {layers_dir}")
 
@@ -667,9 +667,8 @@ if __name__ == "__main__":
     try:
         # example prompt
         prompt_text = """You are a helpful AI assistant. Always respond cheerfully and with text.
-
 User: Do you have a name?
-
+</s>
 """
         output_text = generate_tokens_with_temperature(
             model=model,
@@ -680,7 +679,7 @@ User: Do you have a name?
             dtype=dtype,
             max_new_tokens=7,
             device=device, 
-            temperature=0.6,
+            temperature=0.7,
             prefetch_count=PREFETCH_COUNT,
             embed_layer=embed_layer,
             final_norm=final_norm,

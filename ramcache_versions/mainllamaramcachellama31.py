@@ -7,76 +7,103 @@ import copy
 import math
 import multiprocessing
 
-
 from torch import nn
-from transformers import (
-    LlamaForCausalLM,
-    PreTrainedTokenizerFast,
-    AutoConfig,
-    AutoTokenizer,
-)
 from accelerate import init_empty_weights
-from transformers.models.llama.modeling_llama import (
-    LlamaAttention,
-    LlamaDecoderLayer,
-    LlamaMLP,
-    LlamaRMSNorm,
-)
 
 ##############################################################################
-#  PATCH ADDED HERE: Custom classes
+# LLaMA 3-Specific Imports
 ##############################################################################
+# In LLaMA 3, the tokenizer is handled via Byte Pair Encoding (BPE) from
+# OpenAI's tiktoken instead of sentencepiece. Below is a simple wrapper
+# example to replace the AutoTokenizer or PreTrainedTokenizerFast usage
+# you typically see with LLaMA 2.
+##############################################################################
+import tiktoken
+from transformers import AutoConfig, LlamaForCausalLM
 
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None):
+##############################################################################
+# LLaMA 3 MLP (SwiGLU)
+##############################################################################
+# In some checkpoints, the feedforward dimension (sometimes called n_inner or
+# intermediate_size) is NOT strictly 4 * hidden_size. This fix checks config
+# for the correct dimension so that we match the weights in the checkpoint.
+##############################################################################
+class Llama3MLP(nn.Module):
     """
-    Enhanced Rotary Position Embedding that handles various model sizes.
-    Supports both rope_scaling and original implementation.
-    Fixes dimensionality issues for larger models.
+    Example MLP block using SwiGLU for LLaMA 3.
+    This replaces LlamaMLP from LLaMA 2.
     """
-    # Handle position IDs for variable sequence lengths
-    if position_ids is not None:
-        cos = cos[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
-        sin = sin[position_ids].unsqueeze(1)
-    else:
-        cos = cos.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, dim]
-        sin = sin.unsqueeze(0).unsqueeze(0)
-    
-    # Split heads for rotation
-    q1, q2 = q[..., ::2], q[..., 1::2]
-    k1, k2 = k[..., ::2], k[..., 1::2]
-    
-    # Ensure dimensions match for larger models
-    cos = cos[..., :q1.shape[-1]]  # Truncate to match head dimension
-    sin = sin[..., :q1.shape[-1]]
-    
-    # Apply rotary embeddings
-    q_rot = torch.cat([
-        q1 * cos - q2 * sin,
-        q2 * cos + q1 * sin,
-    ], dim=-1)
-    
-    k_rot = torch.cat([
-        k1 * cos - k2 * sin,
-        k2 * cos + k1 * sin,
-    ], dim=-1)
-    
-    return q_rot, k_rot
+    def __init__(self, config):
+        super().__init__()
+        hidden_size = config.hidden_size
+        
+        # Check if the config specifies an intermediate_size or something like n_inner:
+        if hasattr(config, "intermediate_size") and config.intermediate_size is not None:
+            intermediate_size = config.intermediate_size
+        elif hasattr(config, "n_inner") and config.n_inner is not None:
+            intermediate_size = config.n_inner
+        else:
+            # fallback in case your config doesn't specify it
+            intermediate_size = 4 * hidden_size
 
-class PatchedLlamaAttention(LlamaAttention):
+        # "Gate" and "Up" projections for SwiGLU
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+
+        # SwiGLU uses SiLU (a variant of Swish) plus a gating mechanism
+        self.act_fn = nn.SiLU()
+
+    def forward(self, x):
+        return self.down_proj(
+            self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+        )
+
+##############################################################################
+# LLaMA 3 RMSNorm
+##############################################################################
+# LLaMA 3 still uses RMSNorm for normalization similar to LLaMA 2,
+# so we keep the same approach (potentially with minor improvements).
+##############################################################################
+class Llama3RMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def _norm(self, hidden_states: torch.Tensor):
+        return hidden_states * torch.rsqrt(
+            (hidden_states.float().pow(2).mean(-1, keepdim=True) + self.variance_epsilon)
+        ).to(hidden_states.dtype)
+
+    def forward(self, hidden_states):
+        return self.weight * self._norm(hidden_states)
+
+##############################################################################
+# LLaMA 3 Attention
+##############################################################################
+# Rotary Embeddings and GQA remain the same conceptually as in LLaMA 2, so
+# below is adapted from the original "PatchedLlamaAttention" but renamed for LLaMA 3.
+##############################################################################
+class PatchedLlama3Attention(nn.Module):
     """
-    Enhanced LlamaAttention with support for larger model sizes and GQA.
+    Enhanced Llama3Attention with support for larger model sizes, GQA, and RoPE.
     """
     def __init__(self, config, layer_idx=None):
-        super().__init__(config, layer_idx)
-        self.head_dim = config.hidden_size // config.num_attention_heads
-        # Support for different KV head configurations
-        self.num_key_value_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
+        super().__init__()
         self.num_heads = config.num_attention_heads
-        self.hidden_size = config.hidden_size
-        
-        # Compute repeats needed for GQA
+        self.head_dim = config.hidden_size // self.num_heads
+        self.num_key_value_heads = getattr(config, "num_key_value_heads", self.num_heads)
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        
+
+        # Q, K, V projections
+        self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+
+        # Output projection
+        self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -88,73 +115,89 @@ class PatchedLlamaAttention(LlamaAttention):
         use_cache: bool = False,
     ):
         bsz, q_len, _ = hidden_states.size()
-        
-        # Project with correct dimensions
+
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        # Reshape considering grouped-query attention
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        # Transpose for attention
-        query_states = query_states.transpose(1, 2)
-        key_states = key_states.transpose(1, 2)
-        value_states = value_states.transpose(1, 2)
-
-        # Apply RoPE with proper dimension handling
+        # Apply RoPE if provided
         if freqs_cis is not None:
             cos, sin = freqs_cis
-            # Ensure proper position handling
             if position_ids is None:
                 position_ids = torch.arange(q_len, device=hidden_states.device)
                 position_ids = position_ids.unsqueeze(0).expand(bsz, -1)
-            
+
             query_states, key_states = apply_rotary_pos_emb(
                 query_states, key_states, cos, sin, position_ids=position_ids
             )
 
-        # Handle GQA by repeating KV heads
+        # Handle GQA repeating of KV
         if self.num_key_value_groups > 1:
             key_states = torch.repeat_interleave(key_states, repeats=self.num_key_value_groups, dim=1)
             value_states = torch.repeat_interleave(value_states, repeats=self.num_key_value_groups, dim=1)
 
-        # Compute scaled dot-product attention
         attn_weights = torch.matmul(query_states, key_states.transpose(-1, -2))
         attn_weights = attn_weights / math.sqrt(self.head_dim)
-        
+
         if attention_mask is not None:
             attn_weights = attn_weights + attention_mask
 
-        # Compute attention probabilities
-        attn_weights = torch.nn.functional.softmax(
-            attn_weights, dim=-1, dtype=torch.float32
-        ).to(query_states.dtype)
-
-        # Compute attention output
+        attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_output = torch.matmul(attn_weights, value_states)
-        attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
+        attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, -1)
         attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
             attn_weights = None
 
         return attn_output, attn_weights, past_key_value
-       
-class PatchedLlamaDecoderLayer(LlamaDecoderLayer):
+
+##############################################################################
+# Rotary Positional Embeddings for LLaMA 3
+##############################################################################
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None):
     """
-    Enhanced LlamaDecoderLayer that handles different model architectures.
+    Enhanced Rotary Position Embedding that handles various model sizes.
+    Supports both rope_scaling and original implementation.
+    Fixes dimensionality issues for larger models.
+    """
+    if position_ids is not None:
+        cos = cos[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
+        sin = sin[position_ids].unsqueeze(1)
+    else:
+        cos = cos.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, dim]
+        sin = sin.unsqueeze(0).unsqueeze(0)
+
+    q1, q2 = q[..., ::2], q[..., 1::2]
+    k1, k2 = k[..., ::2], k[..., 1::2]
+
+    cos = cos[..., :q1.shape[-1]]  
+    sin = sin[..., :q1.shape[-1]]
+
+    q_rot = torch.cat([q1 * cos - q2 * sin, q2 * cos + q1 * sin], dim=-1)
+    k_rot = torch.cat([k1 * cos - k2 * sin, k2 * cos + k1 * sin], dim=-1)
+    return q_rot, k_rot
+
+##############################################################################
+# Patched LLaMA 3 Decoder Layer using RMSNorm + SwiGLU MLP + Patched Attention
+##############################################################################
+class PatchedLlama3DecoderLayer(nn.Module):
+    """
+    Enhanced Llama3DecoderLayer that handles different model architectures:
+    - PatchedLlama3Attention (with GQA + RoPE)
+    - Llama3RMSNorm
+    - Llama3MLP (SwiGLU) with dynamic intermediate_size from config
     """
     def __init__(self, config, layer_idx=None):
-        super().__init__(config, layer_idx=layer_idx)
-        self.self_attn = PatchedLlamaAttention(config, layer_idx=layer_idx)
-        
-        # Initialize MLP with correct dimensions
-        self.mlp = LlamaMLP(config)
-        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        super().__init__()
+        self.self_attn = PatchedLlama3Attention(config, layer_idx=layer_idx)
+        self.input_layernorm = Llama3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Llama3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = Llama3MLP(config)
 
     def forward(
         self,
@@ -174,87 +217,6 @@ class PatchedLlamaDecoderLayer(LlamaDecoderLayer):
             attention_mask=attention_mask,
             position_ids=position_ids,
             freqs_cis=freqs_cis,
-            past_key_value=past_key_value,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-        )
-
-        hidden_states = residual + attn_output
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-
-        return (hidden_states, None, None)
-    """
-    Enhanced LlamaDecoderLayer that handles different model architectures.
-    """
-    def __init__(self, config, layer_idx=None):
-        super().__init__(config, layer_idx=layer_idx)
-        self.self_attn = PatchedLlamaAttention(config, layer_idx=layer_idx)
-        
-        # Initialize MLP with correct dimensions
-        self.mlp = LlamaMLP(config)
-        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
-        position_ids: torch.Tensor = None,
-        freqs_cis=None,
-        past_key_value=None,
-        use_cache: bool = False,
-        output_attentions: bool = False,
-    ):
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-
-        attn_output, _, _ = self.self_attn(
-            hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            freqs_cis=freqs_cis,
-            past_key_value=past_key_value,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-        )
-
-        hidden_states = residual + attn_output
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-
-        return (hidden_states, None, None)
-    """
-    Subclass of HF's LlamaDecoderLayer to incorporate patched attention with RoPE.
-    """
-    def __init__(self, config, layer_idx=None):
-        super().__init__(config, layer_idx=layer_idx)
-        # Replace self_attn with our patched attention
-        self.self_attn = PatchedLlamaAttention(config, layer_idx=layer_idx)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
-        position_ids: torch.Tensor = None,
-        freqs_cis=None,       # <--- new param
-        past_key_value=None,
-        use_cache: bool = False,
-        output_attentions: bool = False,
-    ):
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-
-        # Pass freqs_cis to our patched self_attn
-        attn_output, _, _ = self.self_attn(
-            hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            freqs_cis=freqs_cis,  # <---
             past_key_value=past_key_value,
             use_cache=use_cache,
             output_attentions=output_attentions,
@@ -279,9 +241,9 @@ cache_condition = threading.Condition(cache_lock)
 scheduled_layers = set()
 
 ##############################################################################
-#  Modified prefetch_worker to use PatchedLlamaDecoderLayer
+#  Modified prefetch_worker to use PatchedLlama3DecoderLayer
 ##############################################################################
-def prefetch_worker(layers_dir: str, config: AutoConfig, dtype: torch.dtype, patched_layers=None):
+def prefetch_worker(layers_dir: str, config, dtype: torch.dtype, patched_layers=None):
     global stop_prefetch
     try:
         while not stop_prefetch:
@@ -301,7 +263,6 @@ def prefetch_worker(layers_dir: str, config: AutoConfig, dtype: torch.dtype, pat
 
             try:
                 decoder_layer = patched_layers[layer_idx]
-
                 with cache_condition:
                     layer_weights_cache[layer_idx] = decoder_layer
                     scheduled_layers.discard(layer_idx)
@@ -319,7 +280,7 @@ def prefetch_worker(layers_dir: str, config: AutoConfig, dtype: torch.dtype, pat
         print(f"Prefetch worker failed: {e}")
 
 ##############################################################################
-# 1. Utility functions to load embeddings, norm, lm_head
+# 1. Utility functions to load embeddings, norm, lm_head (same concept as LLaMA 2)
 ##############################################################################
 def load_embed_tokens_from_disk(model, layers_dir: str, device: torch.device, dtype: torch.dtype):
     emb_path = os.path.join(layers_dir, "embed_tokens.pt")
@@ -349,43 +310,46 @@ def load_lm_head_from_disk(model, layers_dir: str, device: torch.device, dtype: 
     return model.lm_head
 
 ##############################################################################
-# 2. Layer-by-Layer Offloading Inference Code
+# 2. Layer-by-Layer Offloading Inference Code (adapted for LLaMA 3)
 ##############################################################################
 def precompute_freqs_cis(
-    config: AutoConfig,
+    config,
     max_position: int,
     device: torch.device,
     dtype: torch.dtype = torch.float16,
 ):
     """
-    Updated frequency computation for Llama 3.1
+    Enhanced frequency computation with better support for larger models.
+    RoPE logic is conceptually identical to LLaMA 2; any changes for LLaMA 3
+    revolve around how we handle rope_theta and rope_scaling in config.
     """
     head_dim = config.hidden_size // config.num_attention_heads
-    base = getattr(config, "rope_theta", 10000.0)
-    
-    # Check for newer RoPE scaling methods
-    scaling_type = getattr(config, "rope_scaling_type", "linear")
-    scaling_factor = getattr(config, "rope_scaling_factor", 1.0)
-    
-    if scaling_type == "dynamic":
-        base = base * (scaling_factor ** (head_dim / (head_dim - 2)))
-    elif scaling_type == "linear":
-        base = base * scaling_factor
-    
-    # Compute frequencies with extended precision
-    pos = torch.arange(max_position, device=device, dtype=torch.float32)
-    freqs = torch.arange(0, head_dim, 2, device=device, dtype=torch.float32)
-    freqs = base ** (-freqs / head_dim)
-    
-    # Compute angles with extended precision before converting to final dtype
+    rope_theta = getattr(config, "rope_theta", 10000.0)
+    rope_scaling = getattr(config, "rope_scaling", None)
+    scaling_factor = 1.0
+
+    if rope_scaling:
+        scaling_type = rope_scaling.get("type", "linear")
+        factor = rope_scaling.get("factor", 1.0)
+        if scaling_type == "linear":
+            scaling_factor = factor
+        elif scaling_type == "dynamic":
+            scaling_factor = factor ** (head_dim / (head_dim - 2))
+
+    theta = rope_theta * scaling_factor
+
+    pos = torch.arange(max_position, device=device, dtype=dtype)
+    freqs = torch.arange(0, head_dim, 2, device=device, dtype=dtype)
+    freqs = theta ** (-freqs / head_dim)
     angles = pos.unsqueeze(1) * freqs.unsqueeze(0)
-    return angles.cos().to(dtype), angles.sin().to(dtype)
+
+    return angles.cos(), angles.sin()
 
 def layer_by_layer_inference(
-    model: LlamaForCausalLM,
+    model,
     input_ids: torch.LongTensor,
     layers_dir: str,
-    config: AutoConfig,
+    config,
     dtype: torch.dtype,
     device: torch.device = torch.device("cuda"),
     prefetch_count: int = 2,
@@ -396,39 +360,25 @@ def layer_by_layer_inference(
     transfer_stream = torch.cuda.Stream(device=device, priority=-1)
     compute_stream = torch.cuda.Stream(device=device, priority=0)
 
-    # Get model-specific parameters
     num_layers = config.num_hidden_layers
     hidden_size = config.hidden_size
     num_heads = config.num_attention_heads
     max_seq_len = input_ids.shape[1] + 256
-
-    # Calculate head dimensions for the specific model size
     head_dim = hidden_size // num_heads
 
-    # Precompute RoPE frequencies with model-specific settings
-    cosines, sines = precompute_freqs_cis(
-        config=config,
-        max_position=max_seq_len,
-        device=device,
-        dtype=dtype,
-    )
+    # Precompute RoPE frequencies
+    cosines, sines = precompute_freqs_cis(config, max_position=max_seq_len, device=device, dtype=dtype)
 
-    # Process embeddings
+    # Embeddings
     hidden_states = embed_layer(input_ids.to(device))
 
-    # Process layers with appropriate dimensions
     for i in range(num_layers):
-        # print(f"Processing layer {i}/{num_layers}...")
-        # stime = time.time()
-
-        # Prefetch handling remains the same
         with cache_condition:
             for j in range(i + 1, min(i + 1 + prefetch_count, num_layers)):
                 if j not in layer_weights_cache and j not in scheduled_layers:
                     scheduled_layers.add(j)
                     prefetch_queue.put(j)
 
-        # Wait for layer and process
         with cache_condition:
             if i not in layer_weights_cache and i not in scheduled_layers:
                 scheduled_layers.add(i)
@@ -437,27 +387,17 @@ def layer_by_layer_inference(
                 cache_condition.wait()
             decoder_layer = layer_weights_cache.pop(i)
 
-        # Move layer to device
         with torch.cuda.stream(transfer_stream):
             decoder_layer.to(device, dtype=dtype, non_blocking=True)
 
         batch_size, seq_len = hidden_states.shape[:2]
-
-        # Create attention mask with appropriate dimensions
-        float_mask = torch.zeros(
-            (batch_size, 1, seq_len, seq_len),
-            dtype=dtype,
-            device=device
-        )
-        causal_mask_bool = torch.tril(
-            torch.ones((seq_len, seq_len), dtype=torch.bool, device=device)
-        )
+        float_mask = torch.zeros((batch_size, 1, seq_len, seq_len), dtype=dtype, device=device)
+        causal_mask_bool = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=device))
         float_mask.masked_fill_(~causal_mask_bool, float('-inf'))
 
         position_ids = torch.arange(seq_len, dtype=torch.long, device=device)
         position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
 
-        # Process with streams
         torch.cuda.current_stream(device).wait_stream(transfer_stream)
 
         with torch.cuda.stream(compute_stream):
@@ -472,12 +412,10 @@ def layer_by_layer_inference(
         torch.cuda.current_stream(device).wait_stream(compute_stream)
 
         # Cleanup
-        # decoder_layer.to("cpu")
         del decoder_layer
         torch.cuda.empty_cache()
-        # print(f"Layer {i} took {time.time() - stime:.2f}s")
 
-    # Final processing
+    # Final RMSNorm + LM head
     hidden_states = hidden_states.to(device)
     final_norm = final_norm.to(device, dtype=dtype)
     hidden_states = final_norm(hidden_states)
@@ -485,15 +423,11 @@ def layer_by_layer_inference(
     lm_head = lm_head.to(device, dtype=dtype)
     logits = lm_head(hidden_states)
 
-    # Cleanup
-    final_norm.to("cpu")
-    lm_head.to("cpu")
-
     return logits
 
 def generate_tokens_with_temperature(
     model,
-    tokenizer,
+    encoding,  # Changed from tokenizer to encoding
     prompt,
     layers_dir,
     config,
@@ -506,7 +440,8 @@ def generate_tokens_with_temperature(
     final_norm=None,
     lm_head=None
 ):
-    input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
+    # Encode the prompt using tiktoken
+    input_ids = torch.tensor([encoding.encode(prompt)], dtype=torch.long).to(device)
 
     with torch.inference_mode():
         model.eval()
@@ -524,47 +459,37 @@ def generate_tokens_with_temperature(
                 final_norm=final_norm,
                 lm_head=lm_head
             )
-            
-            # Add normalization and better numerical stability
-            next_logit = logits[:, -1, :]
-            next_logit = torch.nn.functional.log_softmax(next_logit, dim=-1)
-            next_logit = next_logit / temperature
-            
-            # Improved filtering
-            top_k = min(50, next_logit.size(-1))  # Increase top_k
-            top_p = 0.9  # Add nucleus sampling
-            
-            # Sort and filter
+            next_logit = logits[:, -1, :] / temperature
+            next_logit = torch.nan_to_num(next_logit, nan=0.0, posinf=1e4, neginf=-1e4)
+            next_logit = torch.clamp(next_logit, min=-50.0, max=50.0)
+
+            top_k = 20
             sorted_logits, sorted_indices = torch.sort(next_logit, descending=True)
-            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-            
-            # Apply both top-k and top-p filtering
-            sorted_indices_to_keep = cumulative_probs <= top_p
-            sorted_indices_to_keep[:, :top_k] = True
-            
-            # Create distribution
-            next_token_probs = torch.zeros_like(next_logit).scatter_(
-                -1, sorted_indices, torch.softmax(sorted_logits, dim=-1)
+            kth_val = sorted_logits[:, top_k - 1].unsqueeze(-1)
+            filtered_logits = torch.where(
+                next_logit < kth_val,
+                torch.full_like(next_logit, float('-inf')),
+                next_logit
             )
-            next_token_probs = torch.where(
-                next_token_probs > 0,
-                next_token_probs,
-                torch.full_like(next_token_probs, float('-inf'))
-            )
-            
-            # Sample
-            next_token_id = torch.multinomial(torch.softmax(next_token_probs, dim=-1), num_samples=1)
-
+            probs = torch.softmax(filtered_logits, dim=-1)
+            next_token_id = torch.multinomial(probs, num_samples=1)
             input_ids = torch.cat([input_ids, next_token_id], dim=1).to(device)
-            print(f"Single token generation took {time.time() - stime:.2f}s")
+            print(f"Generated token in {time.time() - stime:.2f}s")
 
-    return tokenizer.decode(input_ids[0], skip_special_tokens=False)
+    # Decode the tokens back to text using tiktoken
+    return encoding.decode(input_ids[0].tolist())
 
+##############################################################################
+# 3. Creating and caching the patched LLaMA 3 layers
+##############################################################################
 def create_layer_cache(args):
+    """
+    Creates a PatchedLlama3DecoderLayer and loads its state from disk.
+    """
     config, i, layers_dir = args
     print(f"Preprocessing layer {i}...")
     with init_empty_weights():
-        patched_layer = PatchedLlamaDecoderLayer(config, layer_idx=i)
+        patched_layer = PatchedLlama3DecoderLayer(config, layer_idx=i)
         patched_layer.to_empty(device="cpu")
     state_path = os.path.join(layers_dir, f"layer_{i}.pt")
     loaded_state = torch.load(state_path, map_location="cpu")
@@ -572,62 +497,46 @@ def create_layer_cache(args):
     patched_layer.eval()
     return patched_layer
 
+##############################################################################
+# 4. Main Execution for LLaMA 3
+##############################################################################
 if __name__ == "__main__":
-    # layers_dir = "E:/Llama-3.1-8B/"  # Update this path as needed
-    layers_dir = "F:/8b_model_layers"
-
-    print(f"Loading config/tokenizer from: {layers_dir}")
-
-    # Load configuration
+    # Example path to model layers (adjust for your environment)
+    layers_dir = "E:/Llama-3.1-8B-model-layers"
     config = AutoConfig.from_pretrained(layers_dir)
 
-    # Map string dtype to torch dtype
+    # This snippet maps a string from config to torch dtype
     dtype_mapping = {
         "float32": torch.float32,
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
     }
     dtype = dtype_mapping.get(config.torch_dtype, torch.float16)
-
-    # Set default dtype based on config
     torch.set_default_dtype(dtype)
 
+    # Create a minimal LLaMA 3 model skeleton with empty weights
     with init_empty_weights():
         model = LlamaForCausalLM(config)
 
-    print(config)
+    # Load embeddings, final norm, and lm_head to GPU
+    device = torch.device("cuda")
+    embed_layer = load_embed_tokens_from_disk(model, layers_dir, device=device, dtype=dtype)
+    final_norm = load_final_norm_from_disk(model, layers_dir, device=device, dtype=dtype)
+    lm_head = load_lm_head_from_disk(model, layers_dir, device=device, dtype=dtype)
 
-    # tokenizer = PreTrainedTokenizerFast.from_pretrained(layers_dir)
-    tokenizer = AutoTokenizer.from_pretrained(layers_dir, trust_remote_code=True)
-
-    print("Special tokens:", tokenizer.all_special_tokens)
-    print("Special tokens count:", len(tokenizer.all_special_tokens))
-
-    with init_empty_weights():
-        model = LlamaForCausalLM(config)
-
-    # Load embeddings, final norm, lm_head
-    embed_layer = load_embed_tokens_from_disk(model, layers_dir, device=torch.device("cuda"), dtype=dtype)
-    final_norm = load_final_norm_from_disk(model, layers_dir, device=torch.device("cuda"), dtype=dtype)
-    lm_head = load_lm_head_from_disk(model, layers_dir, device=torch.device("cuda"), dtype=dtype)
-
-    # Externalize prefetch settings to config or define them as variables
     PREFETCH_COUNT = 8
     NUM_PREFETCH_WORKERS = 8
 
-    # Initialize data types and device
-    device = torch.device("cuda")
-
+    # Build the full set of layers in memory (multi-process for speed)
     print("Generating initial layer cache...")
-
     with multiprocessing.Pool() as pool:
         args = []
         for i in range(config.num_hidden_layers):
             args.append((config, i, layers_dir))
         patched_layers = pool.map(create_layer_cache, args)
-    
-    # Start prefetch threads
-    print("launching workers...")
+
+    # Launch background prefetch threads
+    print("Launching prefetch workers...")
     prefetch_threads = []
     for _ in range(NUM_PREFETCH_WORKERS):
         thread = threading.Thread(
@@ -638,21 +547,25 @@ if __name__ == "__main__":
         thread.start()
         prefetch_threads.append(thread)
 
-    try:
-        prompt_text = """You are a helpful AI assistant. Always respond cheerfully and with text.
-User: Do you have a name?
+    # Initialize tiktoken encoding
+    encoding = tiktoken.get_encoding("cl100k_base")  # Adjust if necessary
 
-"""
+    try:
+        prompt_text = (
+            "You are a helpful AI assistant. Always respond cheerfully and with text.\n"
+            "User: Do you have a name?\n"
+            "AI: "
+        )
         output_text = generate_tokens_with_temperature(
             model=model,
-            tokenizer=tokenizer,
+            encoding=encoding,  # Pass encoding instead of tokenizer
             prompt=prompt_text,
             layers_dir=layers_dir,
             config=config,
             dtype=dtype,
-            max_new_tokens=20,
-            device=device, 
-            temperature=0.5,
+            max_new_tokens=50,
+            device=device,
+            temperature=0.7,
             prefetch_count=PREFETCH_COUNT,
             embed_layer=embed_layer,
             final_norm=final_norm,

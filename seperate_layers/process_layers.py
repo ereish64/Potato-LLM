@@ -24,6 +24,7 @@ def save_llama_layers(model_name: str, output_dir: str = "model_layers"):
     tokenizer = PreTrainedTokenizerFast.from_pretrained(model_name)
 
     config = model.config
+    
     print(f"Tokenizer vocab size: {tokenizer.vocab_size}")
     print(f"Special tokens: {tokenizer.special_tokens_map}")
 
@@ -67,5 +68,5 @@ def save_llama_layers(model_name: str, output_dir: str = "model_layers"):
 
 if __name__ == "__main__":
     # save_llama_layers("E:/Llama-2-70B/", "F:/70b_model_layers")
-    save_llama_layers("E:/Llama-3.1-8B/", "F:/8b_model_layers")
+    save_llama_layers("E:/Llama-3.1-8B/", "E:/Llama-3.1-8B-model-layers")
 
