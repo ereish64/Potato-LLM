@@ -3,7 +3,6 @@ import queue
 import threading
 import torch
 import time
-import copy
 import math
 import multiprocessing
 
@@ -61,9 +60,6 @@ class Llama3MLP(nn.Module):
 
 ##############################################################################
 # LLaMA 3 RMSNorm
-##############################################################################
-# LLaMA 3 still uses RMSNorm for normalization similar to LLaMA 2,
-# so we keep the same approach (potentially with minor improvements).
 ##############################################################################
 class Llama3RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -323,7 +319,8 @@ def precompute_freqs_cis(
     RoPE logic is conceptually identical to LLaMA 2; any changes for LLaMA 3
     revolve around how we handle rope_theta and rope_scaling in config.
     """
-    head_dim = config.hidden_size // config.num_attention_heads
+    # head_dim = config.hidden_size // config.num_attention_heads
+    head_dim = config.head_dim
     rope_theta = getattr(config, "rope_theta", 10000.0)
     rope_scaling = getattr(config, "rope_scaling", None)
     scaling_factor = 1.0
@@ -435,11 +432,36 @@ def generate_tokens_with_temperature(
     max_new_tokens=5,
     device=torch.device("cuda"),
     temperature=1.0,
+    top_k=20,
+    top_p=0.95,
     prefetch_count: int = 2,
     embed_layer=None,
     final_norm=None,
     lm_head=None
 ):
+    """
+    Generates tokens using top_k and top_p (nucleus) sampling.
+
+    Args:
+        model: The language model.
+        encoding: The tokenizer encoding.
+        prompt: The input prompt string.
+        layers_dir: Directory containing model layers.
+        config: Model configuration.
+        dtype: Data type for model weights.
+        max_new_tokens: Number of tokens to generate.
+        device: Device to run the model on.
+        temperature: Sampling temperature.
+        top_k: Number of top tokens to keep for top-k filtering.
+        top_p: Cumulative probability threshold for nucleus sampling.
+        prefetch_count: Number of layers to prefetch.
+        embed_layer: Embedding layer.
+        final_norm: Final normalization layer.
+        lm_head: Language model head.
+
+    Returns:
+        The generated text as a string.
+    """
     # Encode the prompt using tiktoken
     input_ids = torch.tensor([encoding.encode(prompt)], dtype=torch.long).to(device)
 
@@ -459,20 +481,43 @@ def generate_tokens_with_temperature(
                 final_norm=final_norm,
                 lm_head=lm_head
             )
+            # Get logits for the last token and apply temperature scaling
             next_logit = logits[:, -1, :] / temperature
+            # Handle NaNs and infinities
             next_logit = torch.nan_to_num(next_logit, nan=0.0, posinf=1e4, neginf=-1e4)
+            # Clamp logits to prevent extreme values
             next_logit = torch.clamp(next_logit, min=-50.0, max=50.0)
 
-            top_k = 20
-            sorted_logits, sorted_indices = torch.sort(next_logit, descending=True)
-            kth_val = sorted_logits[:, top_k - 1].unsqueeze(-1)
-            filtered_logits = torch.where(
-                next_logit < kth_val,
-                torch.full_like(next_logit, float('-inf')),
-                next_logit
-            )
-            probs = torch.softmax(filtered_logits, dim=-1)
+            # Apply Top-K filtering if specified
+            if top_k is not None:
+                sorted_logits, sorted_indices = torch.sort(next_logit, descending=True)
+                kth_val = sorted_logits[:, top_k - 1].unsqueeze(-1)
+                top_k_mask = next_logit < kth_val
+                next_logit = next_logit.masked_fill(top_k_mask, float('-inf'))
+
+            # Apply Top-P (nucleus) filtering if specified
+            if top_p is not None:
+                sorted_logits, sorted_indices = torch.sort(next_logit, descending=True)
+                sorted_probs = torch.softmax(sorted_logits, dim=-1)
+                cumulative_probs = sorted_probs.cumsum(dim=-1)
+
+                # Create a mask for tokens to remove
+                top_p_mask = cumulative_probs > top_p
+                # Shift the mask right to include the first token above the threshold
+                top_p_mask[..., 1:] = top_p_mask[..., :-1].clone()
+                top_p_mask[..., 0] = False
+
+                # Scatter the mask back to the original ordering
+                top_p_mask = top_p_mask.scatter(1, sorted_indices, top_p_mask)
+
+                # Remove tokens with cumulative probability above the threshold
+                next_logit = next_logit.masked_fill(top_p_mask, float('-inf'))
+
+            # Convert logits to probabilities
+            probs = torch.softmax(next_logit, dim=-1)
+            # Sample the next token
             next_token_id = torch.multinomial(probs, num_samples=1)
+            # Append the sampled token to the input_ids
             input_ids = torch.cat([input_ids, next_token_id], dim=1).to(device)
             print(f"Generated token in {time.time() - stime:.2f}s")
 
@@ -511,7 +556,9 @@ if __name__ == "__main__":
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
     }
-    dtype = dtype_mapping.get(config.torch_dtype, torch.float16)
+    print(f"Using dtype: {config.torch_dtype}")
+    # dtype = dtype_mapping.get(config.torch_dtype, torch.float16)
+    dtype = config.torch_dtype
     torch.set_default_dtype(dtype)
 
     # Create a minimal LLaMA 3 model skeleton with empty weights
@@ -536,7 +583,7 @@ if __name__ == "__main__":
         patched_layers = pool.map(create_layer_cache, args)
 
     # Launch background prefetch threads
-    print("Launching prefetch workers...")
+    print("Launching layer prefetch workers...")
     prefetch_threads = []
     for _ in range(NUM_PREFETCH_WORKERS):
         thread = threading.Thread(
@@ -565,7 +612,7 @@ if __name__ == "__main__":
             dtype=dtype,
             max_new_tokens=50,
             device=device,
-            temperature=0.7,
+            temperature=1,
             prefetch_count=PREFETCH_COUNT,
             embed_layer=embed_layer,
             final_norm=final_norm,
