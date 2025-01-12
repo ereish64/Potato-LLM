@@ -560,19 +560,19 @@ if __name__ == "__main__":
     # dtype = dtype_mapping.get(config.torch_dtype, torch.float16)
     dtype = config.torch_dtype
     torch.set_default_dtype(dtype)
+    device = torch.device("cuda")
 
     # Create a minimal LLaMA 3 model skeleton with empty weights
     with init_empty_weights():
         model = LlamaForCausalLM(config)
 
     # Load embeddings, final norm, and lm_head to GPU
-    device = torch.device("cuda")
     embed_layer = load_embed_tokens_from_disk(model, layers_dir, device=device, dtype=dtype)
     final_norm = load_final_norm_from_disk(model, layers_dir, device=device, dtype=dtype)
     lm_head = load_lm_head_from_disk(model, layers_dir, device=device, dtype=dtype)
 
     PREFETCH_COUNT = 8
-    NUM_PREFETCH_WORKERS = 8
+    NUM_PREFETCH_WORKERS = PREFETCH_COUNT
 
     # Build the full set of layers in memory (multi-process for speed)
     print("Generating initial layer cache...")
@@ -612,7 +612,9 @@ if __name__ == "__main__":
             dtype=dtype,
             max_new_tokens=50,
             device=device,
-            temperature=1,
+            temperature=0.5,
+            top_k=20,
+            top_p=0.90,
             prefetch_count=PREFETCH_COUNT,
             embed_layer=embed_layer,
             final_norm=final_norm,

@@ -20,7 +20,7 @@ def save_llama_layers(model_name: str, output_dir: str = "model_layers"):
     print(f"Loading model from: {model_name}")
     torch.set_grad_enabled(False)
 
-    model = LlamaForCausalLM.from_pretrained(model_name, device_map={"": "cpu"})
+    model = LlamaForCausalLM.from_pretrained(model_name, device_map="cpu", torch_dtype=torch.bfloat16)
     tokenizer = PreTrainedTokenizerFast.from_pretrained(model_name)
 
     config = model.config
@@ -68,5 +68,5 @@ def save_llama_layers(model_name: str, output_dir: str = "model_layers"):
 
 if __name__ == "__main__":
     # save_llama_layers("E:/Llama-2-70B/", "F:/70b_model_layers")
-    save_llama_layers("E:/Llama-3.1-8B/", "E:/Llama-3.1-8B-model-layers")
+    save_llama_layers("E:/Llama-3.1-8B-int4/", "E:/Llama-3.1-8B-model-layers-int4")
 
