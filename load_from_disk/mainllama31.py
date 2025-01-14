@@ -130,13 +130,8 @@ def prefetch_worker(layers_dir: str, config: AutoConfig, dtype: torch.dtype):
 
             try:
                 # Create layer in empty state
-                with init_empty_weights():
-                    decoder_layer = PatchedLlamaDecoderLayer(config, layer_idx=layer_idx)
-
-                decoder_layer.to_empty(device="cpu")
                 state_path = os.path.join(layers_dir, f"layer_{layer_idx}.pt")
-                loaded_state = torch.load(state_path, map_location="cpu")
-                decoder_layer.load_state_dict(loaded_state)
+                decoder_layer = torch.load(state_path, map_location="cpu")
                 decoder_layer.eval()
 
                 with cache_condition:
@@ -263,7 +258,7 @@ def layer_by_layer_inference(
 
     # Iterate over each layer
     for i in range(num_layers):
-        print(f"Processing layer {i}/{num_layers}...")
+        # print(f"Processing layer {i}/{num_layers}...")
         stime = time.time()
 
         # Prefetch the next few layers
@@ -319,7 +314,7 @@ def layer_by_layer_inference(
         # Cleanup
         del decoder_layer
         torch.cuda.empty_cache()
-        print(f"Layer {i} took {time.time() - stime:.2f}s")
+        # print(f"Layer {i} took {time.time() - stime:.2f}s")
 
     # Final LN and head
     hidden_states = hidden_states.to(device)
@@ -360,6 +355,7 @@ def generate_tokens_with_temperature(
     with torch.inference_mode():
         model.eval()
         for _ in range(max_new_tokens):
+            stime = time.time()
             logits = layer_by_layer_inference(
                 model,
                 input_ids,
@@ -394,11 +390,12 @@ def generate_tokens_with_temperature(
                 next_token_id = torch.gather(sorted_indices, 1, next_token_id)
 
             input_ids = torch.cat([input_ids, next_token_id.to(device)], dim=1)
+            print(f"Generated token in {time.time() - stime:.2f}s")
 
     return tokenizer.decode(input_ids[0], skip_special_tokens=False)
 
 if __name__ == "__main__":
-    layers_dir = "E:/Llama-3.1-8B-model-layers"
+    layers_dir = "E:/Llama-3.1-70B-model-layers"
 
     print(f"Loading config/tokenizer from: {layers_dir}")
 
@@ -430,7 +427,7 @@ if __name__ == "__main__":
     lm_head = load_lm_head_from_disk(model, layers_dir, device=torch.device("cuda"), dtype=dtype)
 
     # Externalize prefetch settings if desired
-    PREFETCH_COUNT = 10
+    PREFETCH_COUNT = 4
     NUM_PREFETCH_WORKERS = PREFETCH_COUNT
 
     device = torch.device("cuda")
