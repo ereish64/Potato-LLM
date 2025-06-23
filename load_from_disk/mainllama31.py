@@ -14,8 +14,6 @@ from accelerate import init_empty_weights
 from transformers.models.llama.modeling_llama import (
     LlamaAttention,
     LlamaDecoderLayer,
-    LlamaMLP,
-    LlamaRMSNorm,
 )
 
 ##############################################################################
@@ -395,7 +393,8 @@ def generate_tokens_with_temperature(
     return tokenizer.decode(input_ids[0], skip_special_tokens=False)
 
 if __name__ == "__main__":
-    layers_dir = "E:/Llama-3.1-70B-model-layers"
+    layers_dir = "E:/Llama-3.1-8B-model-layers"
+    # layers_dir = "E:/llama-3.1-8b-model-layers"
 
     print(f"Loading config/tokenizer from: {layers_dir}")
 

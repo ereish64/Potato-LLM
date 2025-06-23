@@ -150,5 +150,5 @@ def save_llama_layers(model_name: str, output_dir: str = "model_layers"):
 
 if __name__ == "__main__":
     # save_llama_layers("E:/Llama-2-70B/", "F:/70b_model_layers")
-    save_llama_layers("E:/Llama-3.1-70B/", "E:/Llama-3.1-70B-model-layers")
+    save_llama_layers("D:/Llama-3.1-8B/", "E:/Llama-3.1-8B-model-layers")
 
